@@ -24,12 +24,12 @@ class PipeReader:
         """Create the named pipe"""
         return win32pipe.CreateNamedPipe(
             PIPE_NAME,
-            win32pipe.PIPE_ACCESS_INBOUND,  # Read-only
+            win32pipe.PIPE_ACCESS_INBOUND,
             win32pipe.PIPE_TYPE_BYTE | win32pipe.PIPE_READMODE_BYTE | win32pipe.PIPE_WAIT,
-            1,  # max instances
-            0,  # out buffer (not used for inbound)
-            BUFFER_SIZE * 16,  # in buffer - larger buffer
-            0,  # default timeout
+            1,  
+            0,
+            BUFFER_SIZE * 16,
+            0,
             None,
         )
         
@@ -44,18 +44,13 @@ class PipeReader:
             
             while self.running:
                 try:
-                    # Non-blocking read with timeout
                     hr, data = win32file.ReadFile(pipe, BUFFER_SIZE)
-                    
                     if data:
                         self.total_bytes += len(data)
                         with self.lock:
                             self.latest = data
-                        
-                        # Print progress every 10MB
                         if self.total_bytes % (10 * 1024 * 1024) < BUFFER_SIZE:
                             print(f"Received {self.total_bytes / (1024*1024):.2f} MB")
-                    
                 except pywintypes.error as e:
                     if e.winerror == 109:  # ERROR_BROKEN_PIPE
                         print("FFmpeg disconnected (pipe broken)")
