@@ -1,4 +1,4 @@
-from fastapi import FastAPI, status
+from fastapi import FastAPI, status, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import asyncio
@@ -9,9 +9,53 @@ import threading
 import win32pipe
 import win32file
 import pywintypes
+import json
+import subprocess
+from queue import Queue
+import time
+
+
 
 PIPE_NAME = r"\\.\pipe\ffmpeg_pipe"
-BUFFER_SIZE = 64 * 1024  # Read in 64KB chunks
+BUFFER_SIZE = 64 * 1024
+STREAM_ENDPOINT = "srt://127.0.0.1:9000?mode=listener&latency=20"
+
+class VideStreamListener:
+    def __init__(self):
+        self.stream_cmd =  ["ffmpeg", 
+                    "-fflags", "nobuffer"
+                    , "-flags", "low_delay" 
+                    , "-probesize", "32" 
+                    , "-i", STREAM_ENDPOINT 
+                    , "-map", "0:v:0" 
+                    , "-pix_fmt", "bgr24" 
+                    , "-vcodec", "rawvideo" 
+                    , "-an", "-sn" 
+                    , "-f", "rawvideo" 
+                    , f"{PIPE_NAME}"]        
+        self.running = False
+        self.stream_listener = None
+        self.SUCCESS_INDICATOR_TOKEN = "Output #0"
+        
+    def check_stream_health(self, queue_scheduler):
+        for line in iter(self.stream_listener.stderr.readline, ''):
+            print("FFmpeg receiver:", line.decode(errors='ignore').strip())
+            err_line = line.strip()
+            if self.SUCCESS_INDICATOR_TOKEN in err_line:
+                queue_scheduler.put("SUCCESS")
+            
+    def kill_stream(self):
+        if self.stream_listener and self.stream_listener.poll() is None:
+            self.stream_listener.kill()
+            self.stream_listener.stderr.close()
+    def start_stream(self):
+        try: 
+            self.stream_listener = subprocess.Popen(self.stream_cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
+            self.running = True
+        except Exception as err:
+            print(f"An error occurred at the time of starting the stream: {err}")
+    
+        
 
 class PipeReader:
     def __init__(self):
@@ -21,7 +65,6 @@ class PipeReader:
         self.total_bytes = 0
         
     def create_pipe(self):
-        """Create the named pipe"""
         return win32pipe.CreateNamedPipe(
             PIPE_NAME,
             win32pipe.PIPE_ACCESS_INBOUND,
@@ -41,7 +84,6 @@ class PipeReader:
             print("Waiting for FFmpeg to connect to named pipe...")
             win32pipe.ConnectNamedPipe(pipe, None)
             print("FFmpeg connected! Starting to read data...")
-            
             while self.running:
                 try:
                     hr, data = win32file.ReadFile(pipe, BUFFER_SIZE)
@@ -52,11 +94,8 @@ class PipeReader:
                         if self.total_bytes % (10 * 1024 * 1024) < BUFFER_SIZE:
                             print(f"Received {self.total_bytes / (1024*1024):.2f} MB")
                 except pywintypes.error as e:
-                    if e.winerror == 109:  # ERROR_BROKEN_PIPE
+                    if e.winerror == 109:
                         print("FFmpeg disconnected (pipe broken)")
-                        break
-                    elif e.winerror == 232:  # ERROR_NO_DATA
-                        print("No more data available")
                         break
                     else:
                         print(f"Pipe read error: {e}")
@@ -78,6 +117,8 @@ class BarkTechServer_v2():
         }
         self.stream_reader = PipeReader()
         self.reader_thread = None
+        self.stream_receiver = VideStreamListener()
+        self.video_stream_queue = Queue()
         
     def _setup_middleware(self):
         self.app.add_middleware(
@@ -86,7 +127,7 @@ class BarkTechServer_v2():
             allow_methods=["*"],
             allow_headers=["*"]
         )
-        
+    
     async def setup_routes(self):
         @self.app.on_event("startup")
         def start_pipe_thread():
@@ -113,6 +154,29 @@ class BarkTechServer_v2():
                     return {"size": len(self.stream_reader.latest)}
                 return {"size": 0}
         
+        @self.app.post("/init_stream_check", status_code=status.HTTP_200_OK)
+        async def handle_stream_init_request(req_body):
+            try:
+                print(f"request body: {json.dumps(req_body)}")
+                self.stream_receiver.start_stream()
+                err_reader = threading.Thread(target = self.stream_receiver.check_stream_health, args= (self.video_stream_queue))
+                await asyncio.sleep(1)
+                err_reader.start()
+                start = time.time()
+                while time.time() - start < 3:
+                    err_message = self.video_stream_queue.get(timeout=2)
+                    if err_message == "SUCCESS":
+                        return {"status" : "ffmpeg started and healthy", "health" : "ok"}
+                    elif "ERROR" in err_message or "Invalid" in err_message or "No such file" in err_message:
+                        self.stream_receiver.kill_stream()
+                        return {"status" : "ffmpeg failed to start. check server logs", "health" : "not-ok"}
+                err_reader.join()
+            except Exception as e:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=str(e),
+                )
+            
     async def start(self):
         await self.setup_routes()
         config = uvicorn.Config(self.app, host="0.0.0.0", port=8000, log_level="info")
