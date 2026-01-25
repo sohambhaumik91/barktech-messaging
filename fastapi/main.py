@@ -14,11 +14,15 @@ import subprocess
 from queue import Queue
 import time
 
-
+class StreamInitRequest(BaseModel):
+    device_id: str
+    codec: str
+    resolution: str
+    fps: str
 
 PIPE_NAME = r"\\.\pipe\ffmpeg_pipe"
 BUFFER_SIZE = 64 * 1024
-STREAM_ENDPOINT = "srt://127.0.0.1:9000?mode=listener&latency=20"
+STREAM_ENDPOINT = "srt://0.0.0.0:9000?mode=listener&latency=20"
 
 class VideStreamListener:
     def __init__(self):
@@ -39,7 +43,7 @@ class VideStreamListener:
         
     def check_stream_health(self, queue_scheduler):
         for line in iter(self.stream_listener.stderr.readline, ''):
-            print("FFmpeg receiver:", line.decode(errors='ignore').strip())
+            print("FFmpeg receiver:", line.strip())
             err_line = line.strip()
             if self.SUCCESS_INDICATOR_TOKEN in err_line:
                 queue_scheduler.put("SUCCESS")
@@ -155,11 +159,12 @@ class BarkTechServer_v2():
                 return {"size": 0}
         
         @self.app.post("/init_stream_check", status_code=status.HTTP_200_OK)
-        async def handle_stream_init_request(req_body):
+        async def handle_stream_init_request(req_body: StreamInitRequest):
+            print("Request arrived her")
             try:
-                print(f"request body: {json.dumps(req_body)}")
+                print(f"request body:")
                 self.stream_receiver.start_stream()
-                err_reader = threading.Thread(target = self.stream_receiver.check_stream_health, args= (self.video_stream_queue))
+                err_reader = threading.Thread(target = self.stream_receiver.check_stream_health, args= (self.video_stream_queue, ))
                 await asyncio.sleep(1)
                 err_reader.start()
                 start = time.time()
@@ -179,7 +184,7 @@ class BarkTechServer_v2():
             
     async def start(self):
         await self.setup_routes()
-        config = uvicorn.Config(self.app, host="0.0.0.0", port=8000, log_level="info")
+        config = uvicorn.Config(self.app, host="0.0.0.0", port=8000, log_level="info", reload=True)
         server = uvicorn.Server(config=config)
         await server.serve()
 

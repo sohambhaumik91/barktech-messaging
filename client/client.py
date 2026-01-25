@@ -17,23 +17,27 @@ class Client:
     
     async def client_stream_start_ack(self):
         payload = {
-            "device_id": uuid.uuid4(),
+            "device_id": str(uuid.uuid4()),
             "codec": "H.264",
             "resolution": "480 * 480",
-            "fps": 30
+            "fps": "30"
         }
         stream_endpoint = f"{self.server_base_url}/init_stream_check"
-        async with aiohttp.ClientSession() as session:
-            async with session.post(stream_endpoint, json=payload) as resp:
-                data = await resp.json()
-                print(data)
-                if data.status == "ok":
-                    #start_client streem
-                    self.start_ffmpeg_stream()
-                else:
-                    print("server listener failed to start")
-                    # maybe implement a number of retries before giving up
-                ## based on response received from the server, it will start an ffmpeg stream
+        print(f"stream endpoint is : {stream_endpoint}")
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(stream_endpoint, json=payload) as resp:
+                    if resp.status != 200:
+                        print("Server error:", await resp.text())
+                        return
+                    data = await resp.json()
+                    print(data)
+                    if data["status"] == "ok":
+                        self.start_ffmpeg_stream()
+                    else:
+                        print("server listener failed to start")
+        except Exception as err:
+            print(f"An exception occurred during startup: {err}")
     
     def start_ffmpeg_stream(self):
         try:
@@ -50,6 +54,9 @@ class Client:
             
 if __name__ == "__main__":
     client = Client()
-    asyncio.run(client.client_stream_start_ack())
+    try: 
+        asyncio.run(client.client_stream_start_ack())
+    except Exception as e:
+        print("An error occurred when client was trying to start up.")
 
 
