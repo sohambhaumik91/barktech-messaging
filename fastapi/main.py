@@ -15,6 +15,10 @@ from queue import Queue, Empty
 import time
 import cv2
 import numpy as np
+from ultralytics import YOLO
+from transformers import BitsAndBytesConfig, VitPoseForPoseEstimation, AutoProcessor
+import torch
+from pathlib import Path
 
 
 class StreamInitRequest(BaseModel):
@@ -90,7 +94,7 @@ class PipeReader:
             None,
         )
         
-    def run(self):
+    def run(self, frame_queue):
         self.running = True
         pipe = self.create_pipe()
         
@@ -109,13 +113,10 @@ class PipeReader:
                             self.buffer = self.buffer[FRAME_SIZE:]
                             frame = np.frombuffer(frame_bytes, dtype=np.uint8)
                             frame = frame.reshape((HEIGHT, WIDTH, CHANNELS))
+                            frame_queue.put(frame)
                             with self.lock:
                                 self.latest = frame 
 
-                            cv2.imshow("Pipe Stream", frame)
-                            if cv2.waitKey(1) & 0xFF == ord("q"):
-                                self.running = False
-                                break
                         with self.lock:
                             self.latest = data
                         if self.total_bytes % (10 * 1024 * 1024) < BUFFER_SIZE:
@@ -135,6 +136,30 @@ class PipeReader:
     def stop(self):
         self.running = False
 
+
+
+class InferenceEngine:
+    def __init__(self, model_path, max_workers = 4):
+        self.model_folder = model_path
+        self.setup_models()
+        self.batch_size = 16
+    def setup_models(self):
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.detector_model = YOLO(str(Path(self.model_folder) / "yolo12m.pt")).to(device)
+        
+        ### pose model
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype='float16', 
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type='nf4'
+        )
+        self.pose_model = VitPoseForPoseEstimation.from_pretrained(str(Path(self.model_folder / "best_pose_estimation_v2")), device_map=device, quantization_config=quantization_config, dtype="auto").to(device)
+        self.image_processor = AutoProcessor.from_pretrained("usyd-community/vitpose-base-simple")
+    
+
+
+
 class BarkTechServer_v2():
     def __init__(self):
         self.app = FastAPI()
@@ -144,9 +169,41 @@ class BarkTechServer_v2():
         }
         self.stream_reader = PipeReader()
         self.reader_thread = None
+        #handles streams
         self.stream_receiver = VideStreamListener()
-        self.video_stream_queue = Queue()
+        self.stream_ingress_err_check = Queue()
         
+        #frame queue - decodes raw frames from the raw bytes read from the named pipe
+        self.frame_queue = Queue()
+        self.batch_queue = Queue()
+        self.BATCH_TIMEOUT_MS = 50
+        self.BATCH_SIZE = 16
+    
+    def frame_batcher(self):
+        batch = []
+        batch_start_time = None
+        while True:
+            try:
+                frame = self.frame_queue.get(timeout = self.BATCH_TIMEOUT_MS)
+                if frame is None:
+                    continue
+                if not batch:
+                    batch_start_time = time.time()
+                batch.append(frame)
+                if len(batch) >= self.BATCH_SIZE:
+                    self.batch_queue.put(batch)
+                    batch= []
+                    batch_start_time = None
+            except Empty:
+                elapsed_time_since_last_frame = time.time() - batch_start_time
+                if batch and elapsed_time_since_last_frame > self.BATCH_TIMEOUT_MS:
+                    self.batch_queue.put(batch)
+                    batch_start_time = None
+                    batch = []
+                continue
+                
+                
+    
     def _setup_middleware(self):
         self.app.add_middleware(
             CORSMiddleware,
@@ -159,7 +216,7 @@ class BarkTechServer_v2():
         @self.app.on_event("startup")
         def start_pipe_thread():
             print("Starting pipe reader thread...")
-            self.reader_thread = threading.Thread(target=self.stream_reader.run, daemon=True)
+            self.reader_thread = threading.Thread(target=self.stream_reader.run, args =(self.frame_queue, ), daemon=True)
             self.reader_thread.start()
             
         @self.app.on_event("shutdown")
@@ -187,13 +244,13 @@ class BarkTechServer_v2():
             try:
                 print(f"request body:")
                 self.stream_receiver.start_stream()
-                err_reader = threading.Thread(target = self.stream_receiver.check_stream_health, args= (self.video_stream_queue, ), daemon=True)
+                err_reader = threading.Thread(target = self.stream_receiver.check_stream_health, args= (self.stream_ingress_err_check, ), daemon=True)
                 await asyncio.sleep(1)
                 err_reader.start()
                 start = time.time()
                 while time.time() - start < 6:
                     try:
-                        err_message = self.video_stream_queue.get(timeout=0.5)
+                        err_message = self.stream_ingress_err_check.get(timeout=0.5)
                         print(f"Queue not empty : {err_message}")
                         if err_message == "SUCCESS":
                             threading.Thread(target = self.stream_receiver.log_ffmpeg_err, daemon=True).start()
