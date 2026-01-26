@@ -11,7 +11,7 @@ import win32file
 import pywintypes
 import json
 import subprocess
-from queue import Queue, Empty  
+from queue import Queue, Empty, Full
 import time
 import cv2
 import numpy as np
@@ -19,6 +19,9 @@ from ultralytics import YOLO
 from transformers import BitsAndBytesConfig, VitPoseForPoseEstimation, AutoProcessor
 import torch
 from pathlib import Path
+import concurrent.futures
+import uuid
+import paho.mqtt.client as mqtt
 
 
 class StreamInitRequest(BaseModel):
@@ -143,6 +146,8 @@ class InferenceEngine:
         self.model_folder = model_path
         self.setup_models()
         self.batch_size = 16
+        self.mqtt_callback = None
+        self.executor = concurrent.futures.ProcessPoolExecutor(max_workers=3)
     def setup_models(self):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self.detector_model = YOLO(str(Path(self.model_folder) / "yolo12m.pt")).to(device)
@@ -156,7 +161,28 @@ class InferenceEngine:
         )
         self.pose_model = VitPoseForPoseEstimation.from_pretrained(str(Path(self.model_folder / "best_pose_estimation_v2")), device_map=device, quantization_config=quantization_config, dtype="auto").to(device)
         self.image_processor = AutoProcessor.from_pretrained("usyd-community/vitpose-base-simple")
-    
+        self.batch_processor_started = False
+    def run_inference(self):
+        pass
+    def on_done(self, future):
+        try:
+            result = future.result()
+            self.mqtt_callback(result)
+        except Exception as e:
+            print("Inference failed:", e)
+            
+    def process_frame_batches(self, batch_queue):
+        
+        while self.batch_processor_started:
+            try:
+                batch = batch_queue.get(timeout=0.5)
+                if not batch:
+                    continue
+                future = self.executor.submit(self.run_inference, batch)
+                future.add_done_callback(self._on_done)
+            except Empty:
+                continue
+        
 
 
 
@@ -168,16 +194,31 @@ class BarkTechServer_v2():
             "bytes_received": 0
         }
         self.stream_reader = PipeReader()
+        self.inference_engine = InferenceEngine(Path.cwd() / "models")
         self.reader_thread = None
         #handles streams
         self.stream_receiver = VideStreamListener()
-        self.stream_ingress_err_check = Queue()
+        self.stream_ingress_err_check = Queue() 
         
         #frame queue - decodes raw frames from the raw bytes read from the named pipe
         self.frame_queue = Queue()
-        self.batch_queue = Queue()
-        self.BATCH_TIMEOUT_MS = 50
+        self.batch_queue = Queue(maxsize=32)
+        self.topic = "barktech/inference"
+        self.BATCH_TIMEOUT_MS = 50 / 1000
         self.BATCH_SIZE = 16
+        self.batcher_started = False
+        self.mqtt_client = None
+        self.setup_mqtt_publisher()
+    
+    def publish_message(self, message):
+        message_str = json.dumps(message)
+        pub_info = self.mqtt_client.publish(self.topic, message_str, qos = 1)
+        pub_info.wait_for_publish()
+        
+        
+    def setup_mqtt_publisher(self):
+        self.mqtt_client = mqtt.Client()
+        self.mqtt_client.username_pw_set("root_user", "root_password")
     
     def frame_batcher(self):
         batch = []
@@ -191,16 +232,24 @@ class BarkTechServer_v2():
                     batch_start_time = time.time()
                 batch.append(frame)
                 if len(batch) >= self.BATCH_SIZE:
-                    self.batch_queue.put(batch)
-                    batch= []
+                    try: 
+                        self.batch_queue.put_nowait(batch)
+                    except Full:
+                        self.batch_queue.get_nowait()
+                        self.batch_queue.put_nowait(batch)
+                    batch = []
                     batch_start_time = None
             except Empty:
-                elapsed_time_since_last_frame = time.time() - batch_start_time
-                if batch and elapsed_time_since_last_frame > self.BATCH_TIMEOUT_MS:
-                    self.batch_queue.put(batch)
-                    batch_start_time = None
-                    batch = []
+                if batch_start_time is not None:
+                    elapsed_time_since_last_frame = time.time() - batch_start_time
+                    if batch and elapsed_time_since_last_frame > self.BATCH_TIMEOUT_MS:
+                        self.batch_queue.put(batch)
+                        batch_start_time = None
+                        batch = []
                 continue
+            except Full:
+                print("Queue full")
+                self.batch_queue.put(batch, timeout=1.0)
                 
                 
     
@@ -274,6 +323,12 @@ class BarkTechServer_v2():
         await self.setup_routes()
         config = uvicorn.Config(self.app, host="0.0.0.0", port=8000, log_level="info", reload=True)
         server = uvicorn.Server(config=config)
+        if not self._batcher_started:
+            threading.Thread(target = self.frame_batcher, daemon=True).start()
+            self.batcher_started = True
+        if not self.inference_engine.batch_processor_started:
+            threading.Thread(target = self.inference_engine.process_frame_batches, args=(self.batch_queue, self.publish_message), daemon=True).start()
+            self.inference_engine.batch_processor_started = True
         await server.serve()
 
 if __name__ == "__main__":
