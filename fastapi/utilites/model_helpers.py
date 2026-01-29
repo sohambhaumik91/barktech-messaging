@@ -1,12 +1,39 @@
 
 import numpy as np
-from utilites import EventEnums, EventObject
 from datetime import datetime, timedelta, timezone
 import torch
 import torch.nn.functional as F
 from .metrics import get_intent_score
 import asyncio
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import Dict
+import time
 
+
+class EventEnums(Enum):
+    NO_DOG_DETECTION = "NO_DOG_DETECTED"
+    DOG_INTEREST_HIGH = "DOG_INTEREST_HIGH"
+    DOG_INTEREST_LOW = "DOG_INTEREST_LOW"
+    START_GAME = "START_GAME"
+    END_GAME = "END_GAME"
+    REWARD_DISPENSED = "REWARD_DISPENSED",
+    MAX_ROUNDS_REACHED = "MAX_ROUNDS_REACHED"
+    MAX_NUM_RETRIES_EXHAUSTED = "MAX_NUM_RETRIES_EXHAUSTED"
+    POKE_DONE = "POKE_DONE"
+    MAX_POKES_ALLOWED_EXHAUSTED = "MAX_POKES_ALLOWED_EXHAUSTED"
+    WELCOME_PLAYER = "WELCOME_PLAYER"
+    DOG_FOUND = "DOG_FOUND"
+    COOLDOWN_COMPLETE = "COOLDOWN_COMPLETE"
+    STOP_STREAM = "STOP_STREAM"
+    START_RECEIVING_STREAM = "START_RECEIVING_STREAM"
+
+@dataclass( frozen=True )
+class EventObject:
+    type: EventEnums
+    timestamp: float
+    data: Dict
+    
 
 
 async def empty_asyncio_queue(q: asyncio.Queue):
@@ -24,11 +51,10 @@ def process_frames_batch_for_dog_presence(
         detection_threhsold = 0.6, batch_size = 16,
         intent_score_threshold = 0.4
     ):
-    
-    results = detector_model.predict(frame_batch, stream=True)
+    start_time = time.perf_counter()
+    results = detector_model.predict(frame_batch, imgsz=480, verbose=False)
     bboxes = []
     valid_ix = []
-    
     for ix, result in enumerate(results):
         bbox_per_frame = []
         boxes = result.boxes[result.boxes.cls == 16.0]
@@ -43,6 +69,7 @@ def process_frames_batch_for_dog_presence(
                 bbox_coco = np.array([x_tl, y_tl, w, h])
                 bbox_per_frame.append(bbox_coco)
             bboxes.append(bbox_per_frame)
+    yolo_done = time.perf_counter()
     #check threshold for dog presence
     percentage_detections = len(bboxes) / batch_size
     if percentage_detections < detection_threhsold:
@@ -58,6 +85,8 @@ def process_frames_batch_for_dog_presence(
     scores = torch.stack([pose_result[0]["scores"] for pose_result in pose_results]).to("cuda")
     
     intent_score = get_intent_score(xy, scores, bboxes)
+    total_time = time.perf_counter() - start_time
+    print(f"⏱️ INFERENCE TOTAL: {total_time:.3f}s | YOLO: {yolo_done-start_time:.3f}s | Pose: {total_time-yolo_done:.3f}s")
     if intent_score < intent_score_threshold:
         return EventObject(type=EventEnums.DOG_INTEREST_LOW, data={}, timestamp = datetime.now(timezone.utc))    
     

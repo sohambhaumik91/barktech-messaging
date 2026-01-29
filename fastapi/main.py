@@ -22,7 +22,8 @@ from pathlib import Path
 import concurrent.futures
 import uuid
 import paho.mqtt.client as mqtt
-
+from utilites import process_frames_batch_for_dog_presence
+import multiprocessing as mp
 
 class StreamInitRequest(BaseModel):
     device_id: str
@@ -33,6 +34,42 @@ class StreamInitRequest(BaseModel):
 PIPE_NAME = r"\\.\pipe\ffmpeg_pipe"
 BUFFER_SIZE = 16384
 STREAM_ENDPOINT = "srt://0.0.0.0:9000?mode=listener"
+
+
+def permanent_worker(input_queue):
+    model_path = Path.cwd() / "models"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    detector_model = YOLO(str(model_path / "yolo12m.pt")).to(device)
+    
+    ### pose model
+    quantization_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype='float16', 
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type='nf4'
+    )
+    
+    print("quantization config loaded")
+    pose_model = VitPoseForPoseEstimation.from_pretrained(str(model_path / "best_pose_estimation_v2"), device_map=device, quantization_config=quantization_config, dtype="auto").to(device)
+    image_processor = AutoProcessor.from_pretrained("usyd-community/vitpose-base-simple")
+    print("pose estimation model loaded")
+    print("loading models done ...")
+    while True:
+        try:
+            batch = input_queue.get()
+            if batch is None: 
+                break
+            results = process_frames_batch_for_dog_presence(batch, 
+                                                        detector_model,
+                                                        pose_model,
+                                                        image_processor)
+            print(f"RESULTS =====================================================================================================: {results}")
+            print(f"Worker {mp.current_process().name} with {results }finished a batch.")
+        except Empty:
+            continue
+
+
+
 
 class VideStreamListener:
     def __init__(self):
@@ -105,6 +142,7 @@ class PipeReader:
             print("Waiting for FFmpeg to connect to named pipe...")
             win32pipe.ConnectNamedPipe(pipe, None)
             print("FFmpeg connected! Starting to read data...")
+            frame_index = 0
             while self.running:
                 try:
                     _, data = win32file.ReadFile(pipe, BUFFER_SIZE)
@@ -114,11 +152,13 @@ class PipeReader:
                         while len(self.buffer) >= FRAME_SIZE:
                             frame_bytes = self.buffer[:FRAME_SIZE]
                             self.buffer = self.buffer[FRAME_SIZE:]
-                            frame = np.frombuffer(frame_bytes, dtype=np.uint8)
-                            frame = frame.reshape((HEIGHT, WIDTH, CHANNELS))
-                            frame_queue.put(frame)
-                            with self.lock:
-                                self.latest = frame 
+                            frame_index += 1
+                            if frame_index % 3 == 0:
+                                frame = np.frombuffer(frame_bytes, dtype=np.uint8)
+                                frame = frame.reshape((HEIGHT, WIDTH, CHANNELS))
+                                frame_queue.put(frame)
+                                with self.lock:
+                                    self.latest = frame 
 
                         with self.lock:
                             self.latest = data
@@ -131,7 +171,6 @@ class PipeReader:
                     else:
                         print(f"Pipe read error: {e}")
                         break
-                        
         finally:
             print(f"Closing pipe. Total bytes received: {self.total_bytes}")
             win32file.CloseHandle(pipe)
@@ -140,48 +179,30 @@ class PipeReader:
         self.running = False
 
 
-
 class InferenceEngine:
-    def __init__(self, model_path, max_workers = 4):
+    def __init__(self, model_path, max_workers = 1):
         self.model_folder = model_path
-        self.setup_models()
-        self.batch_size = 16
+        self.batch_size = 8
         self.mqtt_callback = None
         self.executor = concurrent.futures.ProcessPoolExecutor(max_workers=3)
-    def setup_models(self):
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.detector_model = YOLO(str(Path(self.model_folder) / "yolo12m.pt")).to(device)
-        
-        ### pose model
-        quantization_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype='float16', 
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type='nf4'
-        )
-        self.pose_model = VitPoseForPoseEstimation.from_pretrained(str(Path(self.model_folder / "best_pose_estimation_v2")), device_map=device, quantization_config=quantization_config, dtype="auto").to(device)
-        self.image_processor = AutoProcessor.from_pretrained("usyd-community/vitpose-base-simple")
         self.batch_processor_started = False
-    def run_inference(self):
-        pass
-    def on_done(self, future):
+        self.workers = []
+        self.batch_queue = mp.Queue(maxsize=32)
+        for i in range(max_workers):
+            p = mp.Process(target=permanent_worker, args=(self.batch_queue,))
+            p.daemon = True
+            p.start()
+            self.workers.append(p)
+    def submit_batch(self, batch):
+        print(f"batch received: {len(batch)}")
         try:
-            result = future.result()
-            self.mqtt_callback(result)
-        except Exception as e:
-            print("Inference failed:", e)
-            
-    def process_frame_batches(self, batch_queue):
-        
-        while self.batch_processor_started:
+            self.batch_queue.put(batch)
+        except Full:
             try:
-                batch = batch_queue.get(timeout=0.5)
-                if not batch:
-                    continue
-                future = self.executor.submit(self.run_inference, batch)
-                future.add_done_callback(self._on_done)
-            except Empty:
-                continue
+                self.batch_queue.get_nowait()
+                self.batch_queue.put_nowait(batch)
+            except (Empty, Full):
+                pass
         
 
 
@@ -201,16 +222,17 @@ class BarkTechServer_v2():
         self.stream_ingress_err_check = Queue() 
         
         #frame queue - decodes raw frames from the raw bytes read from the named pipe
+        
         self.frame_queue = Queue()
-        self.batch_queue = Queue(maxsize=32)
         self.topic = "barktech/inference"
         self.BATCH_TIMEOUT_MS = 50 / 1000
-        self.BATCH_SIZE = 16
+        self.BATCH_SIZE = 8
         self.batcher_started = False
         self.mqtt_client = None
         self.setup_mqtt_publisher()
+        self.inference_engine.mqtt_callback = self.publish_message_mqtt
     
-    def publish_message(self, message):
+    def publish_message_mqtt(self, message):
         message_str = json.dumps(message)
         pub_info = self.mqtt_client.publish(self.topic, message_str, qos = 1)
         pub_info.wait_for_publish()
@@ -218,38 +240,34 @@ class BarkTechServer_v2():
         
     def setup_mqtt_publisher(self):
         self.mqtt_client = mqtt.Client()
-        self.mqtt_client.username_pw_set("root_user", "root_password")
+        self.mqtt_client.username_pw_set("guest", "guest")
+        self.mqtt_client.connect("127.0.0.1", 5672, keepalive=60)
     
     def frame_batcher(self):
         batch = []
         batch_start_time = None
+        
         while True:
             try:
-                frame = self.frame_queue.get(timeout = self.BATCH_TIMEOUT_MS)
+                frame = self.frame_queue.get(block = True, timeout = 0.2)
                 if frame is None:
                     continue
                 if not batch:
                     batch_start_time = time.time()
                 batch.append(frame)
                 if len(batch) >= self.BATCH_SIZE:
-                    try: 
-                        self.batch_queue.put_nowait(batch)
-                    except Full:
-                        self.batch_queue.get_nowait()
-                        self.batch_queue.put_nowait(batch)
-                    batch = []
+                    self.inference_engine.submit_batch(batch)
+                    batch = []  
                     batch_start_time = None
             except Empty:
                 if batch_start_time is not None:
                     elapsed_time_since_last_frame = time.time() - batch_start_time
-                    if batch and elapsed_time_since_last_frame > self.BATCH_TIMEOUT_MS:
-                        self.batch_queue.put(batch)
+                    if batch and elapsed_time_since_last_frame > 200:
+                        self.inference_engine.submit_batch(batch)
                         batch_start_time = None
                         batch = []
                 continue
-            except Full:
-                print("Queue full")
-                self.batch_queue.put(batch, timeout=1.0)
+            
                 
                 
     
@@ -321,19 +339,19 @@ class BarkTechServer_v2():
             
     async def start(self):
         await self.setup_routes()
-        config = uvicorn.Config(self.app, host="0.0.0.0", port=8000, log_level="info", reload=True)
+        config = uvicorn.Config(self.app, host="0.0.0.0", port=8000, log_level="info", reload=False)
         server = uvicorn.Server(config=config)
-        if not self._batcher_started:
+        if not self.batcher_started:
+            print("FRAME BATCHER STARTED==============")
             threading.Thread(target = self.frame_batcher, daemon=True).start()
             self.batcher_started = True
-        if not self.inference_engine.batch_processor_started:
-            threading.Thread(target = self.inference_engine.process_frame_batches, args=(self.batch_queue, self.publish_message), daemon=True).start()
-            self.inference_engine.batch_processor_started = True
         await server.serve()
+async def main():
+    bt_server = BarkTechServer_v2()
+    await bt_server.start()
 
 if __name__ == "__main__":
-    bt_server = BarkTechServer_v2()
     try:
-        asyncio.run(bt_server.start())
+        asyncio.run(main())
     except KeyboardInterrupt:
         print("\nServer stopped by user.")

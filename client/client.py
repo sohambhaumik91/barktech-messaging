@@ -4,6 +4,8 @@ import asyncio
 import subprocess
 from pathlib import Path
 import time
+import paho.mqtt.client as mqtt
+import json
 
 ## write code for device to load id from local config and fetch streaming configs from the server. maybe AUTH if required!
 class Client:
@@ -15,6 +17,7 @@ class Client:
         ]
         self.sender_proc = None
         self.stream_is_running = False
+        self.mqtt_client = None
     
     async def client_stream_start_ack(self):
         payload = {
@@ -47,9 +50,30 @@ class Client:
             self.sender_proc  = subprocess.Popen(self.stream_cmd, stdout=None, stderr=None)
         except:
             raise Exception("There was an error in starting the stream from the client")
-
-        
+    @staticmethod
+    def client_on_connect(client, userdata, flags, rc):
+        print("Connected to broker with result code:", rc, userdata)
     
+        client.subscribe(userdata["topic"], qos=1)
+    
+    @staticmethod
+    def client_on_message(client, userdata, msg):
+        print("\n--- EVENT RECEIVED ---")
+        print("Topic:", msg.topic)
+
+        try:
+            payload = json.loads(msg.payload.decode())
+            print("Payload:", json.dumps(payload, indent=2))
+        except json.JSONDecodeError:
+            print("Invalid JSON:", msg.payload)
+    
+    def subscribe_to_mqtt(self):
+        self.mqtt_client = mqtt.Client(userdata={"topic": "barktech/inference"})
+        self.mqtt_client.username_pw_set("guest", "guest")
+        self.mqtt_client.on_connect = Client.client_on_connect
+        self.mqtt_client.on_message = Client.client_on_message
+        self.mqtt_client.connect("127.0.0.1", 1883, keepalive=60)
+                
     def stop_ffmpeg_stream(self):
         if self.sender_proc:
             self.sender_proc.terminate()
