@@ -63,7 +63,6 @@ def permanent_worker(input_queue):
                                                         detector_model,
                                                         pose_model,
                                                         image_processor)
-            print(f"RESULTS =====================================================================================================: {results}")
             print(f"Worker {mp.current_process().name} with {results }finished a batch.")
         except Empty:
             continue
