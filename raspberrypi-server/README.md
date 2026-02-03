@@ -39,7 +39,8 @@ OS tested:
 
 ```bash
 cd ~
-wget https://github.com/bluenviron/mediamtx/releases/latest/download/mediamtx_linux_arm64.tar.gz
+wget https://github.com/bluenviron/mediamtx/releases/latest/download/mediamtx_v1.16.0_linux_armv7.tar.gz
+
 ```
 
 For 32-bit OS, use:
@@ -47,6 +48,12 @@ For 32-bit OS, use:
 ```bash
 mediamtx_linux_armv7.tar.gz
 ```
+For specific version, use:
+```bash
+cd ~
+wget https://github.com/bluenviron/mediamtx/releases/latest/download/v1.16.0/mediamtx_linux_arm64.tar.gz
+```
+
 
 ### 3.2 Extract
 
