@@ -1,9 +1,10 @@
 import sqlite3
 
 
-DB_PATH = "events.db"
+EVENTS_DB_PATH = "raw_events.db"
+EVENTS_SUMMARY_DB_PATH = "events_summary.db"
 def init_db():
-    conn = sqlite3.connect(DB_PATH,check_same_thread=False)
+    conn = sqlite3.connect(EVENTS_DB_PATH,check_same_thread=False)
     cursor = conn.cursor()
     
     cursor.execute("PRAGMA journal_mode=WAL;")
@@ -12,11 +13,13 @@ def init_db():
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS events (
         event_id TEXT PRIMARY KEY,
+        session_id TEXT,
         device_id TEXT NOT NULL,
         event_type TEXT NOT NULL,
         timestamp_ms INTEGER NOT NULL,
         sequence INTEGER,
-        payload_json TEXT
+        event_metadata TEXT,
+        event_source TEXT CHECK(event_source IN ('client', 'server'))
     )
     """)
     conn.commit()
