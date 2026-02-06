@@ -16,10 +16,7 @@ class LoggerService:
 
         self.dropped_events = 0
         self.running = True
-
         self.mqtt_client = None
-
-    # ---------- MQTT CALLBACKS ----------
 
     def client_on_message(self, client, userdata, msg):
         try:
@@ -41,7 +38,7 @@ class LoggerService:
         last_flush = time.monotonic()
         conn = sqlite3.connect(
             self.db_path,
-            isolation_level=None  # explicit transactions
+            isolation_level=None
         )
         cursor = conn.cursor()
 
@@ -81,7 +78,28 @@ class LoggerService:
             conn.rollback()
             print(f"DB error: {e}")
 
-
+    def log_event(self, event):
+        conn = sqlite3.connect(self.db_path, isolation_level=None)
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL;")
+        cursor.execute("PRAGMA synchronous=NORMAL;")
+        
+        try:
+            cursor.execute("BEGIN")    
+            cursor.execute(
+                """
+                    INSERT INTO events
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    event
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            conn.rollback()
+            print(f"DB error: {e}")
+        
+        
     def start(self):
         threading.Thread(target=self.event_batcher, daemon=True).start()
 
