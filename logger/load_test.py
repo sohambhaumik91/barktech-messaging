@@ -13,24 +13,31 @@ latencies = []
 for i in range(0, TOTAL_EVENTS, BATCH_SIZE):
     batch_start = time.time()
 
+    batch = []
     for j in range(BATCH_SIZE):
-        event = (
+        batch.append((
+            str(uuid.uuid4()),
             str(uuid.uuid4()),
             "pi-test",
             "BARK",
             int(time.time() * 1000),
             i + j,
-            json.dumps({"amp": 0.73})
+            json.dumps({"amp": 0.73}),
+            "client"
+        ))
+    try:
+        cur.executemany(
+            "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            batch
         )
-        cur.execute("INSERT INTO events VALUES (?, ?, ?, ?, ?, ?)", event)
+        conn.commit()
 
-    conn.commit()
-
-    batch_end = time.time()
-    latencies.append((batch_end - batch_start) * 1000)
-
-    if i % 5000 == 0:
-        print(f"Inserted {i} events")
+        batch_end = time.time()
+        latencies.append((batch_end - batch_start) * 1000)
+    except Exception as e:
+        conn.rollback()
+        print(f"DB error at batch starting index {i}: {e}")
+        # optional: break if you want to stop on first failure
 print("Done.")
 print(f"Avg batch latency (ms): {sum(latencies)/len(latencies):.2f}")
 print(f"Max batch latency (ms): {max(latencies):.2f}")

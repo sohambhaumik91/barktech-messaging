@@ -1,7 +1,7 @@
 import sqlite3
 
 
-EVENTS_DB_PATH = "raw_events.db"
+EVENTS_DB_PATH = ".db"
 EVENTS_SUMMARY_DB_PATH = "events_summary.db"
 # db_paths = [EVENTS_DB_PATH, EVENTS_SUMMARY_DB_PATH]
 def init_db():
